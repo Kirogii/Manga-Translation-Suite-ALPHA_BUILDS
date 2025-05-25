@@ -1,4 +1,6 @@
 # Manga-Translation-Suite-ALPHA_BUILDS
+* DISCLAIMER: NOT ALL FEATURES IN THESE BUILDS WORK
+  
 This is alpha builds of every major version you can test/use alpha builds here i will upload periodically if I update the program with early builds before release
 
 No guides in most cases tho just follow the guide from https://github.com/Kirogii/Manga-Translation-Suite
