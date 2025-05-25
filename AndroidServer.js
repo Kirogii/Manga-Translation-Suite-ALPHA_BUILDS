@@ -5,7 +5,7 @@ const app = express();
 const PORT = 8000;
 
 // Set to a subdomain name or '' for random
-const CUSTOM_SUBDOMAIN = 'my-local-subdomain-manga'; // ← Change this or leave blank for random (some lengths dont work sometimes)
+const CUSTOM_SUBDOMAIN = ''; // ← Change this or leave blank for random (some lengths dont work sometimes)
 
 app.get('/', (req, res) => res.send('Hello from LocalTunnel!'));
 
