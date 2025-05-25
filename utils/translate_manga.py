@@ -5,95 +5,222 @@ This module is used to translate manga from one language to another.
 import os
 import subprocess
 import torch
+import json
+from pathlib import Path
+from typing import Dict, List, Tuple
 
 try:
-    from transformers import MarianMTModel, MarianTokenizer
+    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, MarianMTModel, MarianTokenizer
 except ImportError:
     subprocess.check_call([os.sys.executable, "-m", "pip", "install", "transformers", "sentencepiece"])
-    from transformers import MarianMTModel, MarianTokenizer
+    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, MarianMTModel, MarianTokenizer
 
 # Constants
-MODEL_NAME = "cyy0/JaptoEnBetterMTL-2"
-
-# Ensure model is downloaded on first launch
-from pathlib import Path
-
-import transformers
-
-# Get HuggingFace cache dir
+DEFAULT_MODEL = "cyy0/JaptoEnBetterMTL-2"
+AI_MODELS_PATH = os.path.join(os.path.dirname(__file__), 'AiModels.json')
 TRANSFORMERS_CACHE = os.environ.get('HF_HOME') or os.environ.get('TRANSFORMERS_CACHE') or os.path.expanduser('~/.cache/huggingface/hub')
 
-# Multiple model support
-AVAILABLE_MODELS = [
-    ("cyy0/JaptoEnBetterMTL-2", "2GB"),
-    ("Helsinki-NLP/opus-mt-ja-en", "1.2GB"),
-    ("hal-utokyo/MangaLMM", "15-25GB")
-    # Add more models here as needed
-]
-
-_current_model_name = AVAILABLE_MODELS[0][0]
-_tokenizer = None
-_model = None
+# Global state
+_model_cache: Dict[str, Tuple[any, any]] = {}  # Cache of loaded models and tokenizers
+_current_model_name: str = DEFAULT_MODEL
 _DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def ensure_model_downloaded(model_name):
+def load_ai_models() -> List[List[str]]:
+    """Load or create AiModels.json"""
+    default_models = [
+        ["cyy0/JaptoEnBetterMTL-2", "2GB"],
+        ["Helsinki-NLP/opus-mt-ja-en", "1.2GB"],
+        ["facebook/m2m100_1.2B", "6-12GB"]
+    ]
+    
+    if not os.path.exists(AI_MODELS_PATH):
+        with open(AI_MODELS_PATH, 'w', encoding='utf-8') as f:
+            json.dump({"models": default_models}, f, indent=2)
+        return default_models
+    
     try:
-        model_dir = Path(TRANSFORMERS_CACHE) / model_name.replace('/', '--')
-        if not model_dir.exists() or not any(model_dir.glob("*")):
-            print(f"Downloading model: {model_name}")
-            MarianTokenizer.from_pretrained(model_name)
-            MarianMTModel.from_pretrained(model_name)
-        else:
-            print(f"Model {model_name} already downloaded.")
+        with open(AI_MODELS_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            return data.get("models", default_models)
     except Exception as e:
-        print(f"Error ensuring model download: {e}")
+        print(f"Error loading AiModels.json: {e}")
+        return default_models
 
-def load_model(model_name):
-    global _tokenizer, _model, _current_model_name
-    ensure_model_downloaded(model_name)
-    _tokenizer = MarianTokenizer.from_pretrained(model_name)
-    _model = MarianMTModel.from_pretrained(model_name).to(_DEVICE)
-    _model.eval()
-    _current_model_name = model_name
-    print(f"Loaded translation model: {model_name} on device: {_DEVICE}")
+def save_ai_models(models: List[List[str]]) -> None:
+    """Save models to JSON"""
+    try:
+        with open(AI_MODELS_PATH, 'w', encoding='utf-8') as f:
+            json.dump({"models": models}, f, indent=2)
+    except Exception as e:
+        print(f"Error saving AiModels.json: {e}")
 
-# Load default model at startup
-load_model(_current_model_name)
+def add_ai_model(model_id: str, ram_usage: str) -> List[List[str]]:
+    """Add a new model to the list"""
+    models = load_ai_models()
+    if not any(model[0] == model_id for model in models):
+        models.append([model_id, ram_usage])
+        save_ai_models(models)
+    return models
 
-def get_available_models():
+def load_model(model_name: str) -> bool:
+    """Load model and tokenizer"""
+    global _model_cache, _current_model_name
+    
+    if model_name in _model_cache:
+        print(f"Using cached model: {model_name}")
+        return True
+        
+    print(f"Loading model: {model_name}")
+    try:
+        # Try AutoTokenizer/Model first
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+            model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(_DEVICE)
+        except:
+            # Fallback to MarianMT
+            tokenizer = MarianTokenizer.from_pretrained(model_name)
+            model = MarianMTModel.from_pretrained(model_name).to(_DEVICE)
+        
+        model.eval()
+        _model_cache[model_name] = (tokenizer, model)
+        _current_model_name = model_name
+        print(f"Successfully loaded model: {model_name} on device: {_DEVICE}")
+        return True
+    except Exception as e:
+        print(f"Error loading model {model_name}: {e}")
+        return False
+
+# Initialize available models
+AVAILABLE_MODELS = load_ai_models()
+
+# Ensure default model is loaded
+if not load_model(_current_model_name):
+    print(f"Warning: Failed to load default model {_current_model_name}")
+
+def get_available_models() -> List[List[str]]:
+    """Get list of available models"""
     return AVAILABLE_MODELS
 
-def get_current_model():
+def get_current_model() -> str:
+    """Get current model name"""
     return _current_model_name
 
-def set_current_model(model_name):
+def set_current_model(model_name: str) -> bool:
+    """Set and load a new model"""
+    global _current_model_name
     if model_name not in [m[0] for m in AVAILABLE_MODELS]:
-        raise ValueError(f"Model {model_name} not in available models.")
-    load_model(model_name)
+        raise ValueError(f"Model {model_name} not in available models")
+    
+    # Only reload if different model
+    if model_name != _current_model_name:
+        if not load_model(model_name):
+            return False
+    return True
 
-# Translation function
+
 def translate_manga(text: str, source_lang: str = "ja", target_lang: str = "en") -> str:
-    """
-    Translate manga from one language to another using OPUS model from Hugging Face.
-    Uses CUDA if available.
-    """
-    if not text.strip():
+    """Translate manga text from Japanese to English using the current model."""
+    if not text or not text.strip():
         return ""
 
+    if _current_model_name not in _model_cache:
+        if not load_model(_current_model_name):
+            print(f"Error: Failed to load model {_current_model_name}")
+            return text
+
+    tokenizer, model = _model_cache[_current_model_name]
+    print(f"Using model {_current_model_name} for translation")
+    print(f"Original text: {text}")
+
+    try:
+        # M2M100-style multilingual models
+        if "m2m100" in _current_model_name.lower():
+            tokenizer.src_lang = "ja"
+            encoded = tokenizer(text, return_tensors="pt").to(_DEVICE)
+            with torch.no_grad():
+                output = model.generate(
+                    **encoded,
+                    forced_bos_token_id=tokenizer.get_lang_id("en"),
+                    max_length=256,
+                    num_beams=8,
+                    early_stopping=True,
+                    no_repeat_ngram_size=3,
+                    length_penalty=1.2,
+                    repetition_penalty=2.5
+                )
+            translated_text = tokenizer.decode(output[0], skip_special_tokens=True)
+
+        # MarianMT-style models
+        else:
+            encoded = tokenizer.prepare_seq2seq_batch([text], return_tensors="pt", truncation=True).to(_DEVICE)
+            with torch.no_grad():
+                output = model.generate(
+                    **encoded,
+                    max_length=256,
+                    num_beams=8,
+                    early_stopping=True,
+                    no_repeat_ngram_size=3,
+                    length_penalty=1.2,
+                    repetition_penalty=2.5
+                )
+            translated_text = tokenizer.decode(output[0], skip_special_tokens=True)
+
+        print(f"Translated text: {translated_text}")
+        return translated_text.strip() or text
+
+    except Exception as e:
+        print(f"Translation error: {e}")
+        return text
+
+    """Translate manga text using the current model"""
+    if not text or not text.strip():
+        return ""
+    
     if source_lang == target_lang:
         return text
+
+    if _current_model_name not in _model_cache:
+        if not load_model(_current_model_name):
+            print(f"Error: Failed to load model {_current_model_name}")
+            return text
+
+    tokenizer, model = _model_cache[_current_model_name]
+    print(f"Using model {_current_model_name} for translation")
     print(f"Original text: {text}")
-    inputs = _tokenizer(text, return_tensors="pt", truncation=True).to(_DEVICE)
-    with torch.no_grad():
-        translated = _model.generate(
-            **inputs,
-            max_length=256,
-            num_beams=8,
-            early_stopping=True,
-            no_repeat_ngram_size=3,
-            length_penalty=1.2,
-            repetition_penalty=2.5
-        )
-    translated_text = _tokenizer.decode(translated[0], skip_special_tokens=True)
-    print(f"Translated text: {translated_text}")
-    return translated_text
+    
+    try:
+        # M2M100 needs language codes prepended
+        if "m2m100" in _current_model_name.lower():
+            tokenizer.src_lang = "ja"
+            encoded = tokenizer(text, return_tensors="pt").to(_DEVICE)
+            with torch.no_grad():
+                generated = model.generate(
+                    **encoded,
+                    forced_bos_token_id=tokenizer.get_lang_id("en"),  # Force output language
+                    max_length=256,
+                    num_beams=8,
+                    early_stopping=True,
+                    no_repeat_ngram_size=3,
+                    length_penalty=1.2,
+                    repetition_penalty=2.5,
+                )
+            translated_text = tokenizer.decode(generated[0], skip_special_tokens=True)
+        else:
+            encoded = tokenizer(text, return_tensors="pt", truncation=True).to(_DEVICE)
+            with torch.no_grad():
+                generated = model.generate(
+                    **encoded,
+                    max_length=256,
+                    num_beams=8,
+                    early_stopping=True,
+                    no_repeat_ngram_size=3,
+                    length_penalty=1.2,
+                    repetition_penalty=2.5,
+                )
+            translated_text = tokenizer.decode(generated[0], skip_special_tokens=True)
+
+        print(f"Translated text: {translated_text}")
+        return translated_text
+    except Exception as e:
+        print(f"Translation error: {e}")
+        return text
