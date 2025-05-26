@@ -408,172 +408,18 @@ def predict_url(request_body: dict = Body(...), _: bool = Depends(check_ip_safet
         response.raise_for_status()
         image = Image.open(io.BytesIO(response.content)).convert("RGB")
         np_image = np.array(image)
-        # Use selected OCR model
+
         if ocr_model_in_use == 'hal-utokyo/MangaLMM':
-            # MangaLMM OCR inference with device selection based on GPU RAM
-            # NOTE: MangaLMM uses a multimodal architecture (qwen2_5_vl)
-            try:
-                from transformers import AutoTokenizer, CLIPImageProcessor, AutoModelForVision2Seq
-                import torch
-                import psutil
-                import subprocess
-                import sys
-                model_id = ocr_model_in_use
-                # --- Begin: Hybrid CPU+GPU logic for 4GB GPU + 16GB RAM ---
-                device_map = "auto"
-                torch_dtype = torch.float16
-                use_cpu = False
-                use_4bit = False
-                max_memory = None
-                try:
-                    import bitsandbytes as bnb
-                    use_4bit = True
-                except ImportError:
-                    print("bitsandbytes not installed, 4-bit quantization will not be used.")
-                # Detect GPU RAM
-                gpu_ram_gb = 0
-                try:
-                    if torch.cuda.is_available():
-                        result = subprocess.run([
-                            'nvidia-smi', '--query-gpu=memory.total', '--format=csv,noheader,nounits'
-                        ], capture_output=True, text=True, check=True)
-                        gpu_rams = [int(x.strip()) for x in result.stdout.strip().split('\n') if x.strip().isdigit()]
-                        gpu_ram_mb = max(gpu_rams) if gpu_rams else 0
-                        print(f"[MangaLMM] Detected GPU RAM: {gpu_ram_mb} MB")
-                        max_memory = {}
-                        total_ram_gb = psutil.virtual_memory().total // (1024 ** 3)
-                        cpu_mem = max(12, total_ram_gb - 2)
-                        if gpu_ram_mb <= 4096:
-                            # 4GB GPU: hybrid config, 3GB GPU + CPU
-                            device_map = "auto"
-                            max_memory = {0: "3000MB", "cpu": f"{cpu_mem}GB"}
-                            print(f"[MangaLMM] Using hybrid CUDA+CPU (4GB VRAM, 3GB GPU + {cpu_mem}GB CPU), max_memory: {max_memory}")
-                        elif gpu_ram_mb <= 6144:
-                            # 6GB GPU: hybrid config, 5GB GPU + CPU
-                            device_map = "auto"
-                            max_memory = {0: "5000MB", "cpu": f"{cpu_mem}GB"}
-                            print(f"[MangaLMM] Using hybrid CUDA+CPU (6GB VRAM, 5GB GPU + {cpu_mem}GB CPU), max_memory: {max_memory}")
-                        elif gpu_ram_mb <= 12288:
-                            # 12GB GPU: hybrid config, 10GB GPU + CPU
-                            device_map = "auto"
-                            max_memory = {0: "10000MB", "cpu": f"{cpu_mem}GB"}
-                            print(f"[MangaLMM] Using hybrid CUDA+CPU (12GB VRAM, 10GB GPU + {cpu_mem}GB CPU), max_memory: {max_memory}")
-                        elif gpu_ram_mb >= 30000:
-                            # 30GB+ GPU: use all GPU
-                            device_map = {"": 0}
-                            max_memory = {0: f"{gpu_ram_mb}MB"}
-                            print(f"[MangaLMM] Using full GPU mode (30GB+), max_memory: {max_memory}")
-                        else:
-                            # Other CUDA: use 80% of available GPU + CPU
-                            device_map = "auto"
-                            use_mb = int(gpu_ram_mb * 0.8)
-                            max_memory = {0: f"{use_mb}MB", "cpu": f"{cpu_mem}GB"}
-                            print(f"[MangaLMM] Using hybrid CUDA+CPU (other VRAM, {use_mb}MB GPU + {cpu_mem}GB CPU), max_memory: {max_memory}")
-                        use_cpu = False
-                    else:
-                        use_cpu = True
-                        print("[MangaLMM] CUDA not available, using CPU only.")
-                except Exception as e:
-                    print(f"Could not determine GPU RAM, defaulting to CPU: {e}")
-                    use_cpu = True
-                if use_cpu:
-                    device_map = {"": "cpu"}
-                    torch_dtype = torch.float32
-                    use_4bit = False  # 4-bit quantization is only for CUDA
-                    max_memory = {"cpu": "14GB"}
-                    print("[MangaLMM] Using CPU for inference.")
-                # --- End: Hybrid CPU+GPU logic ---
-                # Cache processor/model globally for performance
-                global mangalmm_tokenizer, mangalmm_image_processor, mangalmm_model
-                if 'mangalmm_tokenizer' not in globals():
-                    print("🔄 Loading MangaLMM tokenizer...")
-                    mangalmm_tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-                if 'mangalmm_image_processor' not in globals():
-                    print("🔄 Loading MangaLMM image processor (CLIPImageProcessor)...")
-                    mangalmm_image_processor = CLIPImageProcessor.from_pretrained(model_id, trust_remote_code=True)
-                if 'mangalmm_model' not in globals():
-                    print("📦 Loading MangaLMM model with accelerate offload and 4-bit quantization..." if use_4bit else "📦 Loading MangaLMM model with accelerate offload...")
-                    model_kwargs = dict(
-                        torch_dtype=torch_dtype,
-                        device_map=device_map,
-                        trust_remote_code=True
-                    )
-                    if max_memory:
-                        model_kwargs["max_memory"] = max_memory
-                    # Add memory optimizations for low-RAM systems
-                    total_ram_gb = psutil.virtual_memory().total // (1024 ** 3)
-                    if total_ram_gb <= 18:
-                        offload_dir = tempfile.mkdtemp(prefix="mangalmm_offload_")
-                        model_kwargs["low_cpu_mem_usage"] = True
-                        model_kwargs["offload_folder"] = offload_dir
-                        print(f"[MangaLMM] low_cpu_mem_usage and offload_folder enabled (RAM: {total_ram_gb}GB)")
-                    if use_4bit:
-                        from transformers import BitsAndBytesConfig
-                        quant_config = BitsAndBytesConfig(
-                            load_in_4bit=True,
-                            bnb_4bit_compute_dtype=torch.float16,
-                            llm_int8_enable_fp32_cpu_offload=True
-                        )
-                        model_kwargs["quantization_config"] = quant_config
-                        model_kwargs.pop('load_in_4bit', None)
-                        model_kwargs.pop('bnb_4bit_compute_dtype', None)
-                        print("[MangaLMM] Using BitsAndBytesConfig for 4-bit quantization with CPU offload enabled.")
-                    # If hybrid, set a custom device_map for offload
-                    if device_map == "auto" and use_4bit:
-                        model_kwargs["device_map"] = {"": 0, "lm_head": "cpu"}
-                        print("[MangaLMM] Custom device_map set for hybrid offload (GPU+CPU).")
-                    mangalmm_model = AutoModelForVision2Seq.from_pretrained(
-                        model_id,
-                        **model_kwargs
-                    )
-                # Set model to eval mode for inference
-                mangalmm_model.eval()
-                prompt = "<image>\nWhat's happening in this scene?"
-                # Prepare inputs using both image processor and tokenizer
-                image_inputs = mangalmm_image_processor(images=image, return_tensors="pt")
-                text_inputs = mangalmm_tokenizer(prompt, return_tensors="pt")
-                # Merge inputs for model
-                inputs = {**image_inputs, **text_inputs}
-                # Move tensors to correct device and dtype
-                for k, v in inputs.items():
-                    if hasattr(v, 'to'):
-                        # Tokenizer outputs (input_ids, attention_mask, etc.) must be torch.long
-                        if k in ["input_ids", "attention_mask", "token_type_ids"]:
-                            inputs[k] = v.to(mangalmm_model.device, dtype=torch.long)
-                        else:
-                            # Image tensors (pixel_values, etc.) can be float
-                            inputs[k] = v.to(mangalmm_model.device, dtype=torch_dtype if not use_cpu else torch.float32)
-                # Warn if any model parameters are on the meta device (uninitialized)
-                meta_params = [n for n, p in mangalmm_model.named_parameters() if getattr(p, 'device', None) and 'meta' in str(p.device)]
-                if meta_params:
-                    print(f"[WARNING] The following parameters are on the meta device (uninitialized): {meta_params}. Model may be too large for available RAM/VRAM.")
-                print("🔮 Generating with MangaLMM (optimized)...")
-                with torch.inference_mode():
-                    # Use small batch size (1) for lowest RAM, and lower max_new_tokens for safety
-                    generated_ids = mangalmm_model.generate(**inputs, max_new_tokens=64, num_beams=1, do_sample=False)
-                    print(f"[DEBUG] generated_ids: {generated_ids}")
-                if generated_ids is None or not hasattr(generated_ids, '__iter__'):
-                    print("[ERROR] Model.generate() returned None or non-iterable. This may indicate an OOM, misconfiguration, or model bug.")
-                    return JSONResponse(status_code=500, content={"code": 500, "message": "MangaLMM model.generate() returned None or non-iterable (possible OOM, model error, or offload issue)."})
-                try:
-                    result = mangalmm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-                except Exception as decode_exc:
-                    print(f"[ERROR] batch_decode failed: {decode_exc}")
-                    return JSONResponse(status_code=500, content={"code": 500, "message": f"MangaLMM batch_decode failed: {decode_exc}"})
-                # Free CUDA memory after inference
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                h, w = np_image.shape[:2]
-                image_info = [{
-                    "box": [0, 0, w, h],
-                    "text": result,
-                    "original_text": result,
-                    "translation": result
-                }]
-                return {"status": "ok", "regions": image_info}
-            except Exception as e:
-                print("Error running MangaLMM OCR:", e)
-                return JSONResponse(status_code=500, content={"code": 500, "message": f"MangaLMM OCR error: {e}"})
+            result, error = translate_mangalmm(image)
+            if error:
+                return JSONResponse(status_code=500, content={"code": 500, "message": error})
+            h, w = np_image.shape[:2]
+            return {"status": "ok", "regions": [{
+                "box": [0, 0, w, h],
+                "text": result,
+                "original_text": result,
+                "translation": result
+            }]}
         else:
             results = predict_bounding_boxes(object_detection_model, np_image)
             image_info = []
@@ -585,16 +431,15 @@ def predict_url(request_body: dict = Body(...), _: bool = Depends(check_ip_safet
                 translation = translate_manga(text)
                 image_info.append({
                     "box": [x1, y1, x2, y2],
-                    "text": translation,  # original Japanese text
+                    "text": translation,
                     "translation": translation,
                     "original_text": text
                 })
             return {"status": "ok", "regions": image_info}
     except Exception as e:
-        print("Error processing URL:", e)
         return JSONResponse(status_code=500, content={"code": 500, "message": str(e)})
 
-@app.post("/get_aimodel")
+@app.post("/set_aimodel")
 def set_aimodel(request_body: dict = Body(...)):
     model_name = request_body.get("model")
     try:

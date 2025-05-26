@@ -224,3 +224,91 @@ def translate_manga(text: str, source_lang: str = "ja", target_lang: str = "en")
     except Exception as e:
         print(f"Translation error: {e}")
         return text
+
+def translate_mangalmm(image: 'PIL.Image.Image') -> Tuple[str, str]:
+    try:
+        from transformers import AutoTokenizer, CLIPImageProcessor, AutoModelForVision2Seq
+        import torch, subprocess, psutil, tempfile
+
+        model_id = "hal-utokyo/MangaLMM"
+        global mangalmm_tokenizer, mangalmm_image_processor, mangalmm_model
+
+        device_map = "auto"
+        torch_dtype = torch.float16
+        use_cpu = False
+        use_4bit = False
+        max_memory = None
+
+        try:
+            import bitsandbytes as bnb
+            use_4bit = True
+        except ImportError:
+            pass
+
+        gpu_ram_mb = 0
+        try:
+            if torch.cuda.is_available():
+                result = subprocess.run(['nvidia-smi', '--query-gpu=memory.total', '--format=csv,noheader,nounits'],
+                                        capture_output=True, text=True, check=True)
+                gpu_rams = [int(x.strip()) for x in result.stdout.strip().split('\n') if x.strip().isdigit()]
+                gpu_ram_mb = max(gpu_rams) if gpu_rams else 0
+                total_ram_gb = psutil.virtual_memory().total // (1024 ** 3)
+                cpu_mem = max(12, total_ram_gb - 2)
+                if gpu_ram_mb <= 4096:
+                    max_memory = {0: "3000MB", "cpu": f"{cpu_mem}GB"}
+                elif gpu_ram_mb <= 6144:
+                    max_memory = {0: "5000MB", "cpu": f"{cpu_mem}GB"}
+                elif gpu_ram_mb <= 12288:
+                    max_memory = {0: "10000MB", "cpu": f"{cpu_mem}GB"}
+                elif gpu_ram_mb >= 30000:
+                    device_map = {"": 0}
+                    max_memory = {0: f"{gpu_ram_mb}MB"}
+                else:
+                    use_mb = int(gpu_ram_mb * 0.8)
+                    max_memory = {0: f"{use_mb}MB", "cpu": f"{cpu_mem}GB"}
+            else:
+                use_cpu = True
+        except:
+            use_cpu = True
+
+        if use_cpu:
+            device_map = {"": "cpu"}
+            torch_dtype = torch.float32
+            use_4bit = False
+            max_memory = {"cpu": "14GB"}
+
+        if 'mangalmm_tokenizer' not in globals():
+            mangalmm_tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        if 'mangalmm_image_processor' not in globals():
+            mangalmm_image_processor = CLIPImageProcessor.from_pretrained(model_id, trust_remote_code=True)
+        if 'mangalmm_model' not in globals():
+            model_kwargs = dict(torch_dtype=torch_dtype, device_map=device_map, trust_remote_code=True)
+            if max_memory: model_kwargs["max_memory"] = max_memory
+            if psutil.virtual_memory().total // (1024 ** 3) <= 18:
+                model_kwargs["low_cpu_mem_usage"] = True
+                model_kwargs["offload_folder"] = tempfile.mkdtemp(prefix="mangalmm_offload_")
+            if use_4bit:
+                from transformers import BitsAndBytesConfig
+                quant_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16,
+                                                  llm_int8_enable_fp32_cpu_offload=True)
+                model_kwargs["quantization_config"] = quant_config
+                if device_map == "auto":
+                    model_kwargs["device_map"] = {"": 0, "lm_head": "cpu"}
+            mangalmm_model = AutoModelForVision2Seq.from_pretrained(model_id, **model_kwargs)
+            mangalmm_model.eval()
+
+        prompt = "<image>\nOcr the text in this image."
+        image_inputs = mangalmm_image_processor(images=image, return_tensors="pt")
+        text_inputs = mangalmm_tokenizer(prompt, return_tensors="pt")
+        inputs = {**image_inputs, **text_inputs}
+        for k, v in inputs.items():
+            if hasattr(v, 'to'):
+                inputs[k] = v.to(mangalmm_model.device, dtype=torch.long if k in ["input_ids", "attention_mask"] else torch_dtype)
+        with torch.inference_mode():
+            generated_ids = mangalmm_model.generate(**inputs, max_new_tokens=64, num_beams=1, do_sample=False)
+        result = mangalmm_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return result.strip(), None
+    except Exception as e:
+        return "", str(e)
