@@ -232,16 +232,6 @@ def ensure_tts_model_downloaded(model_name):
 for tts_model in tts_models.values():
     ensure_tts_model_downloaded(tts_model)
 
-# --- Only check for espeak-ng, do not auto-install ---
-def ensure_espeakng():
-    espeak_path = shutil.which("espeak-ng") or shutil.which("espeak-ng.exe")
-    if espeak_path is None:
-        print("espeak-ng not found. Please install espeak-ng from https://github.com/espeak-ng/espeak-ng/releases and add it to your PATH.")
-    else:
-        print(f"espeak-ng found at {espeak_path}")
-
-ensure_espeakng()
-
 # Initialize Japanese tokenizer at startup
 try:
     tokenizer = TTSTokenizer("ja")
@@ -267,33 +257,44 @@ def decode_base64_image(encoded_image: str) -> Image.Image:
     image = Image.open(io.BytesIO(decoded_bytes))
     return image.convert("RGB")
 
-def calculate_box_distance(box1, box2):
-    """
-    Calculate if two boxes are overlapping or within close proximity (5 pixels).
-    Returns True if boxes are overlapping or close, False otherwise.
-    """
-    x1_1, y1_1, x2_1, y2_1 = map(int, box1[:4])
-    x1_2, y1_2, x2_2, y2_2 = map(int, box2[:4])
-    
-    # Check if boxes overlap or are within 5 pixels
-    return not (x2_1 < x1_2 - 5 or x1_1 > x2_2 + 5 or 
-               y2_1 < y1_2 - 5 or y1_1 > y2_2 + 5)
-
-def calculate_box_area(box):
-    """Calculate the area of a bounding box."""
-    x1, y1, x2, y2 = map(int, box[:4])
-    return (x2 - x1) * (y2 - y1)
-
 def convert_image_to_base64(image: Image.Image) -> str:
     buff = io.BytesIO()
     image.save(buff, format="PNG")
     return base64.b64encode(buff.getvalue()).decode("utf-8")
 
+
 def get_tts_instance(lang):
     if lang not in tts_models:
         raise ValueError(f"Unsupported language: {lang}")
     if lang not in tts_instances:
-        tts_instances[lang] = TTS(tts_models[lang])
+        tts = TTS(
+            model_name=tts_models[lang],
+            progress_bar=False,
+            gpu=False,  # set True if CUDA available
+        )
+
+        # === Speed tweaks ===
+        # General config
+        if hasattr(tts, "config") and tts.config is not None:
+            tts.config.use_cuda = False  # True if you want GPU acceleration
+            tts.config.audio.do_trim_silence = True
+            tts.config.audio.trim_db = 40  # more aggressive trimming
+            tts.config.audio.signal_norm = True
+            tts.config.audio.symmetric_norm = True
+            tts.config.audio.max_norm = 4.0
+            tts.config.audio.clip_norm = True
+
+        # Vocoder config
+        if hasattr(tts, "vocoder_config") and tts.vocoder_config is not None:
+            vc = tts.vocoder_config
+            vc.dither = 0.0
+            vc.noise_scale = 0.4
+            vc.length_scale = 0.85   # <1.0 speeds up but may slightly affect pitch
+            vc.inference_noise_scale = 0.4
+            vc.inference_length_scale = 0.85
+            vc.pad_short = 20
+
+        tts_instances[lang] = tts
     return tts_instances[lang]
 
 # OCR model registry
@@ -325,46 +326,29 @@ def home(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
 @app.post("/predict")
-@app.post("/predict")
 def predict(request_body: dict = Body(...), _: bool = Depends(check_ip_safety)):
     try:
         image = decode_base64_image(request_body["image"])
         np_image = np.array(image)
         results = predict_bounding_boxes(object_detection_model, np_image)
         image_info = []
-        
-        # Filter out overlapping boxes
-        filtered_results = []
-        for i, box1 in enumerate(results):
-            is_valid = True
-            for j, box2 in enumerate(results):
-                if i != j and calculate_box_distance(box1, box2):
-                    # Keep the larger box
-                    area1 = calculate_box_area(box1)
-                    area2 = calculate_box_area(box2)
-                    if area1 < area2:
-                        is_valid = False
-                        break
-            if is_valid:
-                filtered_results.append(box1)
-            
-        # Process filtered boxes
-        for box in filtered_results:
+        for box in results:
             x1, y1, x2, y2 = map(int, box[:4])
             cropped = np_image[y1:y2, x1:x2]
             pil_crop = Image.fromarray(cropped)
             text = get_text_from_image(pil_crop)
-            if text and len(text.strip()) > 0:  # Only add if text was detected
-             translation = translate_manga(text)
-             image_info.append({
+            translation = translate_manga(text)
+            image_info.append({
                 "box": [x1, y1, x2, y2],
                 "text": text,
                 "translation": translation,
-                "original_text": text
+                "original_text": text  # Add original Japanese text
             })
+        return {"status": "ok", "regions": image_info}
     except Exception as e:
         print("Error:", e)
         return JSONResponse(status_code=500, content={"code": 500, "message": str(e)})
+
 @app.get("/list_ocrmodels")
 def list_ocrmodels():
     # List available OCR models and their RAM usage
@@ -561,15 +545,13 @@ def predict_url(request_body: dict = Body(...), _: bool = Depends(check_ip_safet
                 # Free CUDA memory after inference
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                text = result  # MangaLMM generated text
-                translation = translate_manga(text)  # Translate the generated text
-                image_info = []
-                image_info.append({
-                    "box": [x1, y1, x2, y2],  # Cover whole image since MangaLMM processes full image
-                    "text": text,  # Original text from MangaLMM (should be Japanese)
-                    "translation": translation,  # English translation of the text
-                    "original_text": text  # Keep original text for reference
-                })
+                h, w = np_image.shape[:2]
+                image_info = [{
+                    "box": [0, 0, w, h],
+                    "text": result,
+                    "original_text": result,
+                    "translation": result
+                }]
                 return {"status": "ok", "regions": image_info}
             except Exception as e:
                 print("Error running MangaLMM OCR:", e)
@@ -585,7 +567,7 @@ def predict_url(request_body: dict = Body(...), _: bool = Depends(check_ip_safet
                 translation = translate_manga(text)
                 image_info.append({
                     "box": [x1, y1, x2, y2],
-                    "text": text,  # original Japanese text
+                    "text": translation,  # original Japanese text
                     "translation": translation,
                     "original_text": text
                 })
@@ -594,13 +576,11 @@ def predict_url(request_body: dict = Body(...), _: bool = Depends(check_ip_safet
         print("Error processing URL:", e)
         return JSONResponse(status_code=500, content={"code": 500, "message": str(e)})
 
-@app.post("/set_aimodel")
+@app.post("/get_aimodel")
 def set_aimodel(request_body: dict = Body(...)):
     model_name = request_body.get("model")
     try:
-        success = tm.set_current_model(model_name)
-        if not success:
-            raise Exception("Failed to load model")
+        tm.set_current_model(model_name)
         return {"status": "ok", "current_model": tm.get_current_model()}
     except Exception as e:
         return JSONResponse(status_code=400, content={"status": "error", "message": str(e)})
@@ -636,20 +616,6 @@ def tts_get(request: dict = Body(...)):
         return StreamingResponse(io.BytesIO(wav_data), media_type="audio/wav")
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-
-@app.post("/add_aimodel")
-def add_aimodel(request_body: dict = Body(...)):
-    model_id = request_body.get("id")
-    ram_usage = request_body.get("ram")
-    if not model_id or not ram_usage:
-        return JSONResponse(status_code=400, content={"error": "Missing id or ram usage"})
-    try:
-        # Import the function from translate_manga
-        from utils.translate_manga import add_ai_model
-        models = add_ai_model(model_id, ram_usage)
-        return {"status": "ok", "models": models}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
 
 if __name__ == "__main__":
     import uvicorn

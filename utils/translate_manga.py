@@ -152,7 +152,7 @@ def translate_manga(text: str, source_lang: str = "ja", target_lang: str = "en")
 
         # MarianMT-style models
         else:
-            encoded = tokenizer.prepare_seq2seq_batch([text], return_tensors="pt", truncation=True).to(_DEVICE)
+            encoded = tokenizer([text], return_tensors="pt", truncation=True, padding=True).to(_DEVICE)
             with torch.no_grad():
                 output = model.generate(
                     **encoded,
