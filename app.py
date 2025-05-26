@@ -263,39 +263,42 @@ def convert_image_to_base64(image: Image.Image) -> str:
     return base64.b64encode(buff.getvalue()).decode("utf-8")
 
 
+import torch
+
 def get_tts_instance(lang):
     if lang not in tts_models:
         raise ValueError(f"Unsupported language: {lang}")
     if lang not in tts_instances:
+        use_cuda = torch.cuda.is_available()
+
         tts = TTS(
             model_name=tts_models[lang],
             progress_bar=False,
-            gpu=False,  # set True if CUDA available
+            gpu=use_cuda,
         )
 
-        # === Speed tweaks ===
-        # General config
         if hasattr(tts, "config") and tts.config is not None:
-            tts.config.use_cuda = False  # True if you want GPU acceleration
-            tts.config.audio.do_trim_silence = True
-            tts.config.audio.trim_db = 40  # more aggressive trimming
-            tts.config.audio.signal_norm = True
-            tts.config.audio.symmetric_norm = True
-            tts.config.audio.max_norm = 4.0
-            tts.config.audio.clip_norm = True
+            cfg = tts.config
+            cfg.use_cuda = use_cuda
+            cfg.audio.do_trim_silence = True
+            cfg.audio.trim_db = 50
+            cfg.audio.signal_norm = True
+            cfg.audio.symmetric_norm = True
+            cfg.audio.max_norm = 4.0
+            cfg.audio.clip_norm = True
 
-        # Vocoder config
         if hasattr(tts, "vocoder_config") and tts.vocoder_config is not None:
             vc = tts.vocoder_config
             vc.dither = 0.0
-            vc.noise_scale = 0.4
-            vc.length_scale = 0.85   # <1.0 speeds up but may slightly affect pitch
-            vc.inference_noise_scale = 0.4
-            vc.inference_length_scale = 0.85
-            vc.pad_short = 20
+            vc.noise_scale = 0.33
+            vc.length_scale = 0.8  # Balanced between speed and quality
+            vc.inference_noise_scale = 0.33
+            vc.inference_length_scale = 0.8
+            vc.pad_short = 10
 
         tts_instances[lang] = tts
     return tts_instances[lang]
+
 
 # OCR model registry
 ocr_models = [
@@ -325,25 +328,40 @@ def add_ocr_model(request_body: dict = Body(...)):
 def home(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
+
+import time
+
 @app.post("/predict")
 def predict(request_body: dict = Body(...), _: bool = Depends(check_ip_safety)):
+    start_total = time.time()
     try:
+        start_decode = time.time()
         image = decode_base64_image(request_body["image"])
         np_image = np.array(image)
+        print(f"Decode + convert to array: {time.time() - start_decode:.2f}s")
+        
+        start_detection = time.time()
         results = predict_bounding_boxes(object_detection_model, np_image)
+        print(f"Object detection: {time.time() - start_detection:.2f}s")
+        
         image_info = []
         for box in results:
             x1, y1, x2, y2 = map(int, box[:4])
             cropped = np_image[y1:y2, x1:x2]
             pil_crop = Image.fromarray(cropped)
+            start_ocr = time.time()
             text = get_text_from_image(pil_crop)
+            print(f"OCR time: {time.time() - start_ocr:.2f}s")
+            start_translate = time.time()
             translation = translate_manga(text)
+            print(f"Translation time: {time.time() - start_translate:.2f}s")
             image_info.append({
                 "box": [x1, y1, x2, y2],
                 "text": text,
                 "translation": translation,
-                "original_text": text  # Add original Japanese text
+                "original_text": text
             })
+        print(f"Total request time: {time.time() - start_total:.2f}s")
         return {"status": "ok", "regions": image_info}
     except Exception as e:
         print("Error:", e)
